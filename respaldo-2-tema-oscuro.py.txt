@@ -1,0 +1,2140 @@
+# -*- coding: utf-8 -*-
+"""
+Descargador de vídeo y Conversor de formatos
+============================================
+Aplicación de escritorio (Windows / macOS / Linux) construida sobre
+yt-dlp + FFmpeg.
+
+Uso responsable: descarga únicamente contenido propio, con licencia libre
+o cuando cuentes con permiso del titular de los derechos.
+"""
+
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import zipfile
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
+
+APP_NAME = "Descargador y Conversor"
+APP_VERSION = "1.0"
+
+IS_WINDOWS = os.name == "nt"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+BIN_DIR = os.path.join(APP_DIR, "bin")
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+
+FFMPEG_ZIP_URL = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+    "ffmpeg-master-latest-win64-gpl.zip"
+)
+
+# --------------------------------------------------------------------------
+# Catálogos de formatos y calidades
+# --------------------------------------------------------------------------
+
+VIDEO_FORMATS = ["MP4", "MKV", "WEBM", "MOV", "AVI"]
+AUDIO_FORMATS = ["MP3", "M4A", "WAV", "FLAC", "OGG", "OPUS"]
+
+VIDEO_RESOLUTIONS = [
+    ("Mejor disponible", None),
+    ("2160p (4K)", 2160),
+    ("1440p (2K)", 1440),
+    ("1080p (Full HD)", 1080),
+    ("720p (HD)", 720),
+    ("480p", 480),
+    ("360p", 360),
+]
+
+LOSSY_BITRATES = ["320 kbps", "256 kbps", "192 kbps", "160 kbps", "128 kbps", "96 kbps"]
+PCM_QUALITIES = [
+    "16 bit / 44.1 kHz (CD)",
+    "16 bit / 48 kHz",
+    "24 bit / 48 kHz",
+    "24 bit / 96 kHz",
+    "Original",
+]
+
+PCM_MAP = {
+    "16 bit / 44.1 kHz (CD)": ("pcm_s16le", "44100"),
+    "16 bit / 48 kHz": ("pcm_s16le", "48000"),
+    "24 bit / 48 kHz": ("pcm_s24le", "48000"),
+    "24 bit / 96 kHz": ("pcm_s24le", "96000"),
+    "Original": (None, None),
+}
+
+VIDEO_QUALITY_CRF = {
+    "Máxima (archivo grande)": 18,
+    "Alta": 20,
+    "Media (recomendada)": 23,
+    "Baja (archivo pequeño)": 28,
+}
+VIDEO_QUALITY_LIST = list(VIDEO_QUALITY_CRF.keys()) + ["Copiar sin recodificar (rápido)"]
+
+CONVERT_TARGETS = VIDEO_FORMATS + ["GIF"] + AUDIO_FORMATS
+
+# Navegadores de los que se pueden reutilizar las cookies de sesión
+BROWSERS = ["Ninguno", "Chrome", "Edge", "Firefox", "Brave", "Opera", "Vivaldi",
+            "Chromium", "Safari"]
+
+# Escalera de reintentos ante bloqueos (HTTP 403 y similares). YouTube sirve las
+# pistas con firmas distintas según el cliente que las pida; si una falla, se
+# vuelve a intentar pidiéndolas como otro tipo de cliente.
+YOUTUBE_ATTEMPTS = [
+    {"client": None, "label": "predeterminado"},
+    {"client": "tv,web_safari", "label": "tv + web_safari"},
+    {"client": "android,ios", "label": "android + ios"},
+    {"client": "web_embedded,mweb", "label": "web_embedded + mweb",
+     "force_ipv4": True},
+]
+
+# Para el resto de sitios no hay clientes alternativos que probar; lo único que
+# a veces desatasca es forzar IPv4.
+GENERIC_ATTEMPTS = [
+    {"client": None, "label": "predeterminado"},
+    {"client": None, "label": "IPv4 forzado", "force_ipv4": True},
+]
+
+# --------------------------------------------------------------------------
+# Sitios reconocidos
+#   cookies: "no" | "a veces" | "casi siempre"
+#   audio:   el sitio solo sirve audio
+# --------------------------------------------------------------------------
+
+SITES = [
+    {"name": "YouTube", "key": "youtube",
+     "re": r"(?:^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com)",
+     "hint": "Vídeo y audio en pistas separadas: FFmpeg las une.",
+     "cookies": "a veces"},
+    {"name": "TikTok", "key": "tiktok",
+     "re": r"(?:^|\.)(tiktok\.com)",
+     "hint": "Se descarga en MP4 y sin marca de agua cuando está disponible.",
+     "cookies": "a veces"},
+    {"name": "Reddit", "key": "reddit",
+     "re": r"(?:^|\.)(reddit\.com|redd\.it)",
+     "hint": "El audio va aparte: sin FFmpeg el vídeo saldría mudo.",
+     "cookies": "no"},
+    {"name": "X / Twitter", "key": "twitter",
+     "re": r"(?:^|\.)(twitter\.com|x\.com|t\.co)",
+     "hint": "Los perfiles privados o el contenido sensible necesitan cookies.",
+     "cookies": "a veces"},
+    {"name": "Instagram", "key": "instagram",
+     "re": r"(?:^|\.)(instagram\.com|instagr\.am)",
+     "hint": "Casi siempre exige tu sesión: elige el navegador en «Cookies de:».",
+     "cookies": "casi siempre"},
+    {"name": "Facebook", "key": "facebook",
+     "re": r"(?:^|\.)(facebook\.com|fb\.watch|fb\.com)",
+     "hint": "Casi siempre exige tu sesión: elige el navegador en «Cookies de:».",
+     "cookies": "casi siempre"},
+    {"name": "Twitch", "key": "twitch",
+     "re": r"(?:^|\.)(twitch\.tv)",
+     "hint": "Funciona con VOD y clips. Los directos se graban desde el momento "
+             "en que empiezas.",
+     "cookies": "a veces"},
+    {"name": "Vimeo", "key": "vimeo",
+     "re": r"(?:^|\.)(vimeo\.com)",
+     "hint": "Los vídeos con contraseña necesitan cookies.",
+     "cookies": "a veces"},
+    {"name": "Dailymotion", "key": "dailymotion",
+     "re": r"(?:^|\.)(dailymotion\.com|dai\.ly)", "hint": "", "cookies": "no"},
+    {"name": "SoundCloud", "key": "soundcloud",
+     "re": r"(?:^|\.)(soundcloud\.com|snd\.sc)",
+     "hint": "Sitio de audio: se descargará como pista de sonido.",
+     "cookies": "no", "audio": True},
+    {"name": "Bandcamp", "key": "bandcamp",
+     "re": r"(?:^|\.)(bandcamp\.com)",
+     "hint": "Sitio de audio: se descargará como pista de sonido.",
+     "cookies": "no", "audio": True},
+    {"name": "Mixcloud", "key": "mixcloud",
+     "re": r"(?:^|\.)(mixcloud\.com)",
+     "hint": "Sitio de audio: se descargará como pista de sonido.",
+     "cookies": "no", "audio": True},
+    {"name": "Internet Archive", "key": "archive",
+     "re": r"(?:^|\.)(archive\.org)",
+     "hint": "Archivo público: material de dominio público y libre.",
+     "cookies": "no"},
+    {"name": "RTVE", "key": "rtve", "re": r"(?:^|\.)(rtve\.es)",
+     "hint": "Televisión pública en abierto.", "cookies": "no"},
+    {"name": "Rumble", "key": "rumble", "re": r"(?:^|\.)(rumble\.com)",
+     "hint": "", "cookies": "no"},
+    {"name": "Odysee", "key": "odysee", "re": r"(?:^|\.)(odysee\.com|lbry\.tv)",
+     "hint": "", "cookies": "no"},
+    {"name": "Streamable", "key": "streamable",
+     "re": r"(?:^|\.)(streamable\.com)", "hint": "", "cookies": "no"},
+    {"name": "VK", "key": "vk", "re": r"(?:^|\.)(vk\.com|vkvideo\.ru)",
+     "hint": "", "cookies": "a veces"},
+    {"name": "Bilibili", "key": "bilibili", "re": r"(?:^|\.)(bilibili\.com)",
+     "hint": "", "cookies": "a veces"},
+    {"name": "Telegram", "key": "telegram", "re": r"(?:^|\.)(t\.me)",
+     "hint": "Solo canales públicos.", "cookies": "no"},
+    {"name": "Pinterest", "key": "pinterest", "re": r"(?:^|\.)(pinterest\.[a-z.]+)",
+     "hint": "", "cookies": "no"},
+    {"name": "Tumblr", "key": "tumblr", "re": r"(?:^|\.)(tumblr\.com)",
+     "hint": "", "cookies": "a veces"},
+    {"name": "Enlace directo", "key": "direct",
+     "re": r"\.(mp4|webm|mkv|mov|mp3|m4a|ogg|wav|flac|m3u8|mpd)(?:\?|#|$)",
+     "hint": "Archivo o emisión servidos directamente por el servidor.",
+     "cookies": "no"},
+]
+
+
+def detect_site(url):
+    """Reconoce la red a partir de la URL. Devuelve None si no hay coincidencia."""
+    if not url or not url.strip():
+        return None
+    url = url.strip()
+    match = re.match(r"^(?:https?://)?([^/?#]+)", url, re.I)
+    host = (match.group(1) if match else "").lower()
+    host = host.split("@")[-1].split(":")[0]
+    for site in SITES:
+        target = url if site["key"] == "direct" else host
+        if re.search(site["re"], target, re.I):
+            return site
+    return None
+
+
+def attempts_for(site):
+    """Escalera de reintentos adecuada al sitio detectado."""
+    if site and site["key"] == "youtube":
+        return YOUTUBE_ATTEMPTS
+    if site is None:
+        return YOUTUBE_ATTEMPTS  # sitio desconocido: puede ser un espejo
+    return GENERIC_ATTEMPTS
+
+# Errores que merece la pena reintentar con otro cliente
+BLOCK_RE = re.compile(
+    r"(http error 403|forbidden|unable to download video data|"
+    r"unable to download webpage|fragment.*(not found|failed)|"
+    r"unable to extract|player response|precondition check failed|"
+    r"requested format is not available|giving up after)", re.I)
+
+# Errores que solo se arreglan con cookies de una sesión iniciada
+BOT_RE = re.compile(r"(sign in to confirm|not a bot|confirm your age|"
+                    r"age.?restricted|private video|members[- ]only)", re.I)
+
+MEDIA_EXTS = (
+    ".mp4 .mkv .webm .mov .avi .flv .wmv .m4v .mpg .mpeg .ts .3gp "
+    ".mp3 .m4a .wav .flac .ogg .opus .aac .wma .aiff .alac"
+).split()
+
+
+# --------------------------------------------------------------------------
+# Utilidades de sistema
+# --------------------------------------------------------------------------
+
+def creation_flags():
+    """Evita que se abran ventanas negras de consola en Windows."""
+    if IS_WINDOWS:
+        return subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    return 0
+
+
+def clean_env():
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def run_capture(cmd, timeout=25):
+    """Ejecuta un comando y devuelve (codigo, salida)."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=creation_flags(),
+            env=clean_env(),
+            timeout=timeout,
+        )
+        out = proc.stdout.decode("utf-8", "replace").strip()
+        return proc.returncode, out
+    except FileNotFoundError:
+        return 127, "No encontrado"
+    except subprocess.TimeoutExpired:
+        return 124, "Tiempo de espera agotado"
+    except Exception as exc:  # pragma: no cover - defensivo
+        return 1, str(exc)
+
+
+def _exe(name):
+    return name + ".exe" if IS_WINDOWS else name
+
+
+def find_ffmpeg():
+    local = os.path.join(BIN_DIR, _exe("ffmpeg"))
+    if os.path.isfile(local):
+        return local
+    return shutil.which("ffmpeg")
+
+
+def find_ffprobe():
+    local = os.path.join(BIN_DIR, _exe("ffprobe"))
+    if os.path.isfile(local):
+        return local
+    return shutil.which("ffprobe")
+
+
+def find_ytdlp():
+    """Devuelve la lista de argumentos base para invocar yt-dlp."""
+    local = os.path.join(BIN_DIR, _exe("yt-dlp"))
+    if os.path.isfile(local):
+        return [local]
+    try:
+        import yt_dlp  # noqa: F401
+        return [sys.executable, "-m", "yt_dlp"]
+    except Exception:
+        pass
+    found = shutil.which("yt-dlp")
+    if found:
+        return [found]
+    return None
+
+
+def default_download_dir():
+    home = os.path.expanduser("~")
+    for folder in ("Downloads", "Descargas", "Videos", "Vídeos"):
+        candidate = os.path.join(home, folder)
+        if os.path.isdir(candidate):
+            return candidate
+    return home
+
+
+def unique_path(path):
+    """Evita sobrescribir: archivo.mp4 -> archivo (1).mp4"""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 1
+    while os.path.exists(f"{base} ({i}){ext}"):
+        i += 1
+    return f"{base} ({i}){ext}"
+
+
+def human_time(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+# --------------------------------------------------------------------------
+# Construcción de comandos
+# --------------------------------------------------------------------------
+
+def build_ytdlp_args(url, opts):
+    """Construye los argumentos de yt-dlp a partir de las opciones de la GUI."""
+    args = [
+        "--newline", "--no-warnings", "--ignore-config", "--progress",
+        # Reintentos internos: la mayoría de los cortes son temporales
+        "--retries", "10",
+        "--fragment-retries", "10",
+        "--extractor-retries", "5",
+        "--file-access-retries", "5",
+        "--retry-sleep", "http:exp=1:20",
+    ]
+
+    client = opts.get("client")
+    if client:
+        args += ["--extractor-args", f"youtube:player_client={client}"]
+
+    cookies = opts.get("cookies")
+    if cookies and cookies != "Ninguno":
+        args += ["--cookies-from-browser", cookies.lower()]
+
+    if opts.get("force_ipv4"):
+        args += ["--force-ipv4"]
+
+    ffmpeg = opts.get("ffmpeg")
+    if ffmpeg:
+        args += ["--ffmpeg-location", os.path.dirname(ffmpeg) or ffmpeg]
+
+    outdir = opts["outdir"]
+    if opts.get("playlist"):
+        args += ["--yes-playlist"]
+        tmpl = os.path.join(
+            outdir, "%(playlist_title)s", "%(playlist_index)03d - %(title)s.%(ext)s"
+        )
+    else:
+        args += ["--no-playlist"]
+        tmpl = os.path.join(outdir, "%(title)s.%(ext)s")
+    args += ["-o", tmpl]
+
+    if opts.get("mode") == "audio":
+        fmt = opts["format"].lower()
+        args += ["-f", "bestaudio/best", "-x", "--audio-format", fmt]
+        quality = opts.get("quality", "")
+        if fmt in ("wav", "flac"):
+            codec, rate = PCM_MAP.get(quality, (None, None))
+            pp = []
+            if rate:
+                pp += ["-ar", rate]
+            if codec and fmt == "wav":
+                pp += ["-c:a", codec]
+            if pp:
+                args += ["--postprocessor-args", "ExtractAudio:" + " ".join(pp)]
+        else:
+            kbps = re.sub(r"[^0-9]", "", quality) or "192"
+            args += ["--audio-quality", f"{kbps}K"]
+        if opts.get("extras"):
+            args += ["--embed-metadata"]
+            # WAV no admite carátula incrustada
+            if fmt != "wav":
+                args += ["--embed-thumbnail"]
+    else:
+        fmt = opts["format"].lower()
+        height = opts.get("height")
+        hfilter = f"[height<={height}]" if height else ""
+        if fmt == "mp4":
+            selector = (
+                f"bv*{hfilter}[ext=mp4]+ba[ext=m4a]/"
+                f"bv*{hfilter}+ba/b{hfilter}/b"
+            )
+        elif fmt == "webm":
+            selector = (
+                f"bv*{hfilter}[ext=webm]+ba[ext=webm]/"
+                f"bv*{hfilter}+ba/b{hfilter}/b"
+            )
+        else:
+            selector = f"bv*{hfilter}+ba/b{hfilter}/b"
+        args += ["-f", selector]
+
+        if fmt in ("mp4", "mkv", "webm"):
+            args += ["--merge-output-format", fmt]
+        else:  # mov, avi -> requieren recodificar
+            args += ["--merge-output-format", "mkv", "--recode-video", fmt]
+
+        if opts.get("subs"):
+            args += [
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs",
+                "es.*,en.*",
+                "--convert-subs",
+                "srt",
+            ]
+            if fmt in ("mp4", "mkv", "webm"):
+                args += ["--embed-subs"]
+        if opts.get("extras"):
+            args += ["--embed-metadata", "--embed-thumbnail"]
+
+    args.append(url)
+    return args
+
+
+def build_ffmpeg_args(src, dst, target, opts):
+    """Construye los argumentos de FFmpeg para convertir un archivo local."""
+    target = target.lower()
+    args = ["-hide_banner", "-loglevel", "error", "-nostdin",
+            "-progress", "pipe:1", "-y", "-i", src]
+
+    if target in [f.lower() for f in AUDIO_FORMATS]:
+        args += ["-vn"]
+        quality = opts.get("audio_quality", "192 kbps")
+        if target == "wav":
+            codec, rate = PCM_MAP.get(quality, ("pcm_s16le", "44100"))
+            args += ["-c:a", codec or "pcm_s16le"]
+            if rate:
+                args += ["-ar", rate]
+        elif target == "flac":
+            _, rate = PCM_MAP.get(quality, (None, None))
+            args += ["-c:a", "flac"]
+            if rate:
+                args += ["-ar", rate]
+        else:
+            kbps = re.sub(r"[^0-9]", "", quality) or "192"
+            codec = {
+                "mp3": "libmp3lame",
+                "m4a": "aac",
+                "ogg": "libvorbis",
+                "opus": "libopus",
+            }[target]
+            args += ["-c:a", codec, "-b:a", f"{kbps}k"]
+        args.append(dst)
+        return args
+
+    # ---- vídeo ----
+    height = opts.get("height")
+    quality = opts.get("video_quality", "Media (recomendada)")
+    vf = []
+    if height:
+        vf.append(f"scale=-2:trunc(min(ih\\,{height})/2)*2")
+
+    if target == "gif":
+        fps = opts.get("gif_fps", 12)
+        width = opts.get("gif_width", 480)
+        args += [
+            "-filter_complex",
+            f"fps={fps},scale={width}:-1:flags=lanczos,"
+            f"split[a][b];[a]palettegen[p];[b][p]paletteuse",
+            "-loop", "0",
+        ]
+        args.append(dst)
+        return args
+
+    if quality.startswith("Copiar"):
+        args += ["-c", "copy"]
+        if target == "mp4":
+            args += ["-movflags", "+faststart"]
+        args.append(dst)
+        return args
+
+    crf = VIDEO_QUALITY_CRF.get(quality, 23)
+    if target == "webm":
+        args += ["-c:v", "libvpx-vp9", "-crf", str(crf + 8), "-b:v", "0",
+                 "-row-mt", "1", "-c:a", "libopus", "-b:a", "160k"]
+    elif target == "avi":
+        args += ["-c:v", "mpeg4", "-vtag", "xvid", "-qscale:v", "4",
+                 "-c:a", "libmp3lame", "-b:a", "192k"]
+    else:  # mp4, mkv, mov
+        args += ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
+                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"]
+        if target in ("mp4", "mov"):
+            args += ["-movflags", "+faststart"]
+
+    if vf:
+        args += ["-vf", ",".join(vf)]
+    args.append(dst)
+    return args
+
+
+def probe_duration(ffprobe, path):
+    if not ffprobe:
+        return None
+    rc, out = run_capture(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", path]
+    )
+    try:
+        value = float(out.strip().splitlines()[-1])
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Diseño: paleta, tipografías y widgets propios
+#
+# Todo se dibuja con tkinter puro (sin dependencias externas) para que la
+# aplicación siga siendo un único archivo fácil de empaquetar.
+#
+# Las medidas se escriben en «píxeles de diseño» (a 96 ppp) y se pasan por
+# S() para que la ventana se vea nítida en pantallas con escalado 125/150/200 %.
+# --------------------------------------------------------------------------
+
+BG        = "#0f1117"   # fondo de la ventana
+SIDEBAR   = "#0a0c11"   # barra lateral
+CARD      = "#171a22"   # tarjetas
+CARD_SOFT = "#1e222c"   # controles dentro de una tarjeta
+FIELD     = "#111319"   # cajas de texto
+BORDER    = "#272c38"
+BORDER_HI = "#3b4354"
+TEXT      = "#e9ecf3"
+MUTED     = "#8991a5"
+ACCENT    = "#6c5ce7"
+ACCENT_HI = "#8577f0"
+ACCENT_LO = "#241f42"
+OK        = "#4ade80"
+ERR       = "#fb7185"
+INFO      = "#60a5fa"
+WARN      = "#fbbf24"
+
+UI_SCALE = 1.0          # se calcula en App.__init__ a partir del DPI real
+_UI_FAMILY = None
+_MONO_FAMILY = None
+
+
+def enable_dpi_awareness():
+    """Evita que Windows estire la ventana (que se vería borrosa)."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        try:
+            # Per-monitor v2: nítido también al mover la ventana entre pantallas
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+        except Exception:
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def S(value):
+    """Convierte píxeles de diseño en píxeles reales de pantalla."""
+    return int(round(value * UI_SCALE))
+
+
+def ui_font(size=10, weight="normal"):
+    """Tipografía de interfaz, con alternativas si el sistema no la tiene."""
+    global _UI_FAMILY
+    if _UI_FAMILY is None:
+        families = set(tkfont.families())
+        for candidate in ("Segoe UI", "Inter", "SF Pro Text", "Helvetica Neue",
+                          "Ubuntu", "DejaVu Sans"):
+            if candidate in families:
+                _UI_FAMILY = candidate
+                break
+        else:
+            _UI_FAMILY = tkfont.nametofont("TkDefaultFont").cget("family")
+    return (_UI_FAMILY, size, weight)
+
+
+def mono_font(size=9):
+    global _MONO_FAMILY
+    if _MONO_FAMILY is None:
+        families = set(tkfont.families())
+        for candidate in ("Cascadia Mono", "Consolas", "SF Mono", "Menlo",
+                          "DejaVu Sans Mono"):
+            if candidate in families:
+                _MONO_FAMILY = candidate
+                break
+        else:
+            _MONO_FAMILY = tkfont.nametofont("TkFixedFont").cget("family")
+    return (_MONO_FAMILY, size)
+
+
+def round_rect(canvas, x1, y1, x2, y2, r, **kwargs):
+    """Rectángulo de esquinas redondeadas sobre un Canvas."""
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    points = [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, **kwargs)
+
+
+def dark_titlebar(window):
+    """Barra de título oscura en Windows 10/11 (se ignora en otros sistemas)."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1)
+        for attribute in (20, 19):  # 20 en Win11/Win10 nuevo, 19 en builds viejas
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value))
+    except Exception:
+        pass
+
+
+def _widget_bg(widget):
+    try:
+        return widget.cget("bg")
+    except tk.TclError:
+        return BG
+
+
+class Card(tk.Frame):
+    """Panel con borde de 1 px, título opcional y un `body` donde colocar todo."""
+
+    def __init__(self, master, title=None, hint=None, pad=16, bg=CARD):
+        super().__init__(master, bg=BORDER)
+        self.bg = bg
+        pad = S(pad)
+        inner = tk.Frame(self, bg=bg)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        if title:
+            tk.Label(inner, text=title, bg=bg, fg=TEXT,
+                     font=ui_font(11, "bold")).pack(anchor="w", padx=pad,
+                                                    pady=(pad, 0))
+        if hint:
+            tk.Label(inner, text=hint, bg=bg, fg=MUTED, font=ui_font(9),
+                     justify="left", wraplength=S(760)).pack(anchor="w", padx=pad,
+                                                             pady=(S(4), 0))
+        self.body = tk.Frame(inner, bg=bg)
+        self.body.pack(fill="both", expand=True, padx=pad,
+                       pady=(S(12) if title else pad, pad))
+
+
+class SoftButton(tk.Canvas):
+    """Botón redondeado con estados de hover, pulsado y deshabilitado."""
+
+    STYLES = {
+        # kind: (relleno, hover, texto, borde)
+        "accent": (ACCENT, ACCENT_HI, "#ffffff", ""),
+        "ghost":  (CARD_SOFT, "#2b3140", TEXT, BORDER),
+        "quiet":  ("", "#232834", MUTED, ""),
+        "danger": ("#3a2028", "#4d2831", ERR, "#4d2f38"),
+    }
+
+    def __init__(self, master, text, command=None, kind="ghost", width=120,
+                 height=36, radius=9, bg=None, font=None, icon=None):
+        bg = bg or _widget_bg(master)
+        super().__init__(master, width=S(width), height=S(height), bg=bg,
+                         highlightthickness=0, bd=0, takefocus=1)
+        self._kind = kind
+        self._text = text
+        self._icon = icon
+        self._radius = S(radius)
+        self._font = font or ui_font(10, "bold")
+        self._command = command
+        self._btn_state = "normal"
+        self._hover = False
+        self._pressed = False
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self._redraw()
+
+    # -- API compatible con los widgets ttk a los que sustituye --
+    def configure(self, **kwargs):
+        if "text" in kwargs:
+            self._text = kwargs.pop("text")
+        if "state" in kwargs:
+            self._btn_state = kwargs.pop("state")
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if kwargs:
+            super().configure(**kwargs)
+        self._redraw()
+
+    config = configure
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width() or int(self["width"])
+        h = self.winfo_height() or int(self["height"])
+        fill, hover, fg, border = self.STYLES[self._kind]
+
+        if self._btn_state == "disabled":
+            fill, fg, border = "#20242e", "#5a6070", ""
+        elif self._pressed and fill:
+            fill = ACCENT_LO if self._kind == "accent" else "#20242e"
+        elif self._hover:
+            fill = hover
+            if self._kind == "quiet":
+                fg = TEXT
+
+        if fill:
+            round_rect(self, 1, 1, w - 1, h - 1, self._radius, fill=fill,
+                       outline=border or fill)
+        elif border:
+            round_rect(self, 1, 1, w - 1, h - 1, self._radius, fill="",
+                       outline=border)
+
+        label = f"{self._icon}  {self._text}" if self._icon else self._text
+        self.create_text(w / 2, h / 2 + 1, text=label, fill=fg, font=self._font)
+
+    def _on_enter(self, _e):
+        self._hover = True
+        if self._btn_state != "disabled":
+            self.configure(cursor="hand2")
+        self._redraw()
+
+    def _on_leave(self, _e):
+        self._hover = self._pressed = False
+        self._redraw()
+
+    def _on_press(self, _e):
+        if self._btn_state == "disabled":
+            return
+        self._pressed = True
+        self._redraw()
+
+    def _on_release(self, _e):
+        was_pressed = self._pressed
+        self._pressed = False
+        self._redraw()
+        if was_pressed and self._btn_state != "disabled" and self._command:
+            self._command()
+
+
+class Check(tk.Canvas):
+    """Casilla de verificación dibujada a mano (ttk no admite tema oscuro)."""
+
+    def __init__(self, master, text, variable, bg=None, command=None):
+        bg = bg or _widget_bg(master)
+        self._font = ui_font(10)
+        font_obj = tkfont.Font(font=self._font)
+        width = font_obj.measure(text) + S(34)
+        super().__init__(master, width=width, height=S(26), bg=bg,
+                         highlightthickness=0, bd=0)
+        self._var = variable
+        self._text = text
+        self._command = command
+        self._enabled = True
+        self._hover = False
+        self.bind("<Button-1>", self._toggle)
+        self.bind("<Enter>", lambda _e: (setattr(self, "_hover", True), self._redraw()))
+        self.bind("<Leave>", lambda _e: (setattr(self, "_hover", False), self._redraw()))
+        variable.trace_add("write", lambda *_: self._redraw())
+        self._redraw()
+
+    def set_enabled(self, enabled):
+        self._enabled = enabled
+        self._redraw()
+
+    def _toggle(self, _e=None):
+        if not self._enabled:
+            return
+        self._var.set(not self._var.get())
+        if self._command:
+            self._command()
+
+    def _redraw(self):
+        self.delete("all")
+        on = bool(self._var.get())
+        if not self._enabled:
+            box, mark, fg = "#20242e", "#5a6070", "#5a6070"
+        elif on:
+            box, mark, fg = ACCENT, "#ffffff", TEXT
+        else:
+            box, mark, fg = (BORDER_HI if self._hover else BORDER), "", TEXT
+        round_rect(self, S(4), S(4), S(22), S(22), S(5),
+                   fill=box if on or not self._enabled else FIELD,
+                   outline=ACCENT if on else box)
+        if on:
+            self.create_line(S(8), S(13), S(12), S(17), S(18), S(9), fill=mark,
+                             width=max(2, S(2)), capstyle="round",
+                             joinstyle="round")
+        self.create_text(S(32), S(13), text=self._text, anchor="w", fill=fg,
+                         font=self._font)
+        self.configure(cursor="hand2" if self._enabled else "")
+
+
+class Segmented(tk.Canvas):
+    """Selector tipo pestañas-píldora para dos o tres opciones."""
+
+    def __init__(self, master, options, variable, bg=None, command=None,
+                 width=320, height=38):
+        bg = bg or _widget_bg(master)
+        super().__init__(master, width=S(width), height=S(height), bg=bg,
+                         highlightthickness=0, bd=0)
+        self._segments = options          # [(etiqueta, valor), ...]
+        self._var = variable
+        self._command = command
+        self._hover = -1
+        self.bind("<Button-1>", self._click)
+        self.bind("<Motion>", self._motion)
+        self.bind("<Leave>", lambda _e: (setattr(self, "_hover", -1), self._redraw()))
+        self.bind("<Configure>", lambda _e: self._redraw())
+        variable.trace_add("write", lambda *_: self._redraw())
+        self._redraw()
+
+    def _index_at(self, x):
+        w = self.winfo_width() or int(self["width"])
+        return max(0, min(len(self._segments) - 1,
+                          int(x / (w / len(self._segments)))))
+
+    def _click(self, event):
+        label, value = self._segments[self._index_at(event.x)]
+        if self._var.get() != value:
+            self._var.set(value)
+            if self._command:
+                self._command()
+
+    def _motion(self, event):
+        index = self._index_at(event.x)
+        if index != self._hover:
+            self._hover = index
+            self._redraw()
+        self.configure(cursor="hand2")
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width() or int(self["width"])
+        h = self.winfo_height() or int(self["height"])
+        pad = S(3)
+        round_rect(self, 0, 0, w, h, S(10), fill=CARD_SOFT, outline=BORDER)
+        seg = w / len(self._segments)
+        for i, (label, value) in enumerate(self._segments):
+            x1, x2 = i * seg, (i + 1) * seg
+            selected = self._var.get() == value
+            if selected:
+                round_rect(self, x1 + pad, pad, x2 - pad, h - pad, S(8),
+                           fill=ACCENT, outline=ACCENT)
+            elif i == self._hover:
+                round_rect(self, x1 + pad, pad, x2 - pad, h - pad, S(8),
+                           fill="#262b38", outline="#262b38")
+            self.create_text((x1 + x2) / 2, h / 2, text=label,
+                             fill="#ffffff" if selected else MUTED,
+                             font=ui_font(10, "bold" if selected else "normal"))
+
+
+class ProgressBar(tk.Canvas):
+    """Barra de progreso con modo determinado e indeterminado."""
+
+    def __init__(self, master, bg=None, height=8, width=400):
+        bg = bg or _widget_bg(master)
+        super().__init__(master, height=S(height), width=S(width), bg=bg,
+                         highlightthickness=0, bd=0)
+        self._value = 0.0
+        self._indeterminate = False
+        self._offset = 0.0
+        self._anim = None
+        self.bind("<Configure>", lambda _e: self._redraw())
+
+    def set_value(self, pct):
+        self.stop()
+        self._value = max(0.0, min(100.0, float(pct)))
+        self._redraw()
+
+    def start_indeterminate(self):
+        if self._indeterminate:
+            return
+        self._indeterminate = True
+        self._offset = 0.0
+        self._tick()
+
+    def stop(self):
+        self._indeterminate = False
+        if self._anim is not None:
+            self.after_cancel(self._anim)
+            self._anim = None
+
+    def _tick(self):
+        if not self._indeterminate:
+            return
+        self._offset = (self._offset + 2.2) % 130
+        self._redraw()
+        self._anim = self.after(16, self._tick)
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width() or int(self["width"])
+        h = self.winfo_height() or int(self["height"])
+        r = h / 2
+        round_rect(self, 0, 0, w, h, r, fill="#1b1f29", outline="#1b1f29")
+        if self._indeterminate:
+            span = w * 0.3
+            x = -span + (self._offset / 130) * (w + span)
+            round_rect(self, max(0, x), 0, min(w, x + span), h, r,
+                       fill=ACCENT, outline=ACCENT)
+        elif self._value > 0:
+            round_rect(self, 0, 0, max(h, w * self._value / 100), h, r,
+                       fill=ACCENT, outline=ACCENT)
+
+
+class NavItem(tk.Frame):
+    """Entrada de la barra lateral."""
+
+    def __init__(self, master, icon, text, command):
+        super().__init__(master, bg=SIDEBAR, cursor="hand2")
+        self._command = command
+        self._selected = False
+        self._marker = tk.Frame(self, bg=SIDEBAR, width=S(3))
+        self._marker.pack(side="left", fill="y")
+        self._box = tk.Frame(self, bg=SIDEBAR)
+        self._box.pack(side="left", fill="both", expand=True)
+        self._icon = tk.Label(self._box, text=icon, bg=SIDEBAR, fg=MUTED,
+                              font=ui_font(12))
+        self._icon.pack(side="left", padx=(S(13), S(10)), pady=S(11))
+        self._label = tk.Label(self._box, text=text, bg=SIDEBAR, fg=MUTED,
+                               font=ui_font(10))
+        self._label.pack(side="left")
+        for widget in (self, self._box, self._icon, self._label):
+            widget.bind("<Button-1>", lambda _e: self._command())
+            widget.bind("<Enter>", lambda _e: self._paint(hover=True))
+            widget.bind("<Leave>", lambda _e: self._paint(hover=False))
+
+    def set_selected(self, selected):
+        self._selected = selected
+        self._paint()
+
+    def _paint(self, hover=False):
+        if self._selected:
+            bg, fg, marker = "#181b24", TEXT, ACCENT
+        elif hover:
+            bg, fg, marker = "#12151d", TEXT, SIDEBAR
+        else:
+            bg, fg, marker = SIDEBAR, MUTED, SIDEBAR
+        self._marker.configure(bg=marker)
+        for widget in (self, self._box):
+            widget.configure(bg=bg)
+        self._icon.configure(bg=bg, fg=ACCENT if self._selected else fg)
+        self._label.configure(bg=bg, fg=fg,
+                              font=ui_font(10, "bold" if self._selected else "normal"))
+
+
+def make_entry(parent, textvariable, bg=CARD, state="normal"):
+    """Caja de texto con marco propio; devuelve (contenedor, entry)."""
+    frame = tk.Frame(parent, bg=BORDER)
+    inner = tk.Frame(frame, bg=FIELD)
+    inner.pack(fill="both", expand=True, padx=1, pady=1)
+    entry = tk.Entry(inner, textvariable=textvariable, bg=FIELD, fg=TEXT,
+                     relief="flat", highlightthickness=0, bd=0,
+                     insertbackground=ACCENT_HI, font=ui_font(10),
+                     disabledbackground="#15181f", disabledforeground=MUTED,
+                     selectbackground=ACCENT_LO, selectforeground=TEXT,
+                     state=state)
+    entry.pack(fill="both", expand=True, padx=S(11), pady=S(8))
+    entry.bind("<FocusIn>", lambda _e: frame.configure(bg=ACCENT))
+    entry.bind("<FocusOut>", lambda _e: frame.configure(bg=BORDER))
+    return frame, entry
+
+
+def field_label(parent, text, bg=CARD):
+    return tk.Label(parent, text=text, bg=bg, fg=MUTED, font=ui_font(9, "bold"))
+
+
+# --------------------------------------------------------------------------
+# Aplicación
+# --------------------------------------------------------------------------
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        # Escalado: en pantallas a 125/150/200 % todo se dibuja en píxeles
+        # reales, de modo que la ventana se ve nítida en vez de estirada.
+        global UI_SCALE
+        UI_SCALE = max(1.0, round(self.winfo_fpixels("1i") / 96.0, 2))
+        self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
+
+        self.title(f"{APP_NAME} {APP_VERSION}")
+        self.geometry(f"{S(1060)}x{S(800)}")
+        self.minsize(S(940), S(680))
+        self.configure(bg=BG)
+
+        self.msg_queue = queue.Queue()
+        self.worker = None
+        self.proc = None
+        self.cancelled = False
+
+        self.ffmpeg = find_ffmpeg()
+        self.ffprobe = find_ffprobe()
+        self.ytdlp = find_ytdlp()
+
+        self.config_data = self._load_config()
+
+        self._build_style()
+        self._build_ui()
+        dark_titlebar(self)
+        self._refresh_tools(initial=True)
+        self.after(100, self._drain_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------------- configuración persistente ----------------
+
+    def _load_config(self):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+
+    def _save_config(self):
+        data = {
+            "outdir": self.var_outdir.get(),
+            "conv_outdir": self.var_conv_outdir.get(),
+            "mode": self.var_mode.get(),
+            "video_format": self.var_vformat.get(),
+            "audio_format": self.var_aformat.get(),
+            "cookies": self.cmb_cookies.get(),
+        }
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    # ---------------- interfaz ----------------
+
+    def _build_style(self):
+        """Adapta los pocos widgets ttk que se siguen usando al tema oscuro."""
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        style.configure("Dark.TCombobox",
+                        fieldbackground=FIELD, background=CARD_SOFT,
+                        foreground=TEXT, arrowcolor=MUTED, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER,
+                        insertcolor=TEXT, relief="flat", padding=(10, 7))
+        style.map("Dark.TCombobox",
+                  fieldbackground=[("readonly", FIELD), ("disabled", "#15181f")],
+                  foreground=[("disabled", "#5a6070")],
+                  bordercolor=[("focus", ACCENT), ("hover", BORDER_HI)],
+                  arrowcolor=[("disabled", "#4b5160"), ("hover", TEXT)],
+                  selectbackground=[("readonly", FIELD)],
+                  selectforeground=[("readonly", TEXT)])
+        self.option_add("*TCombobox*Listbox.background", CARD_SOFT)
+        self.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.borderWidth", 0)
+        self.option_add("*TCombobox*Listbox.font", ui_font(10))
+
+        style.configure("Dark.Vertical.TScrollbar",
+                        background="#2b313e", troughcolor=FIELD,
+                        bordercolor=FIELD, arrowcolor=MUTED,
+                        darkcolor="#2b313e", lightcolor="#2b313e",
+                        relief="flat", borderwidth=0, arrowsize=12)
+        style.map("Dark.Vertical.TScrollbar",
+                  background=[("active", BORDER_HI)])
+
+    def _combo(self, parent, width, values=(), state="readonly"):
+        return ttk.Combobox(parent, style="Dark.TCombobox", width=width,
+                            values=list(values), state=state, font=ui_font(10))
+
+    def _build_ui(self):
+        self._build_sidebar()
+
+        main = tk.Frame(self, bg=BG)
+        main.pack(side="left", fill="both", expand=True)
+
+        self.header_title = tk.Label(main, text="", bg=BG, fg=TEXT,
+                                     font=ui_font(17, "bold"), anchor="w")
+        self.header_title.pack(fill="x", padx=S(28), pady=(S(22), 0))
+        self.header_sub = tk.Label(main, text="", bg=BG, fg=MUTED,
+                                   font=ui_font(10), anchor="w")
+        self.header_sub.pack(fill="x", padx=S(28), pady=(S(3), S(16)))
+
+        # La barra inferior se coloca antes que las páginas para que siempre
+        # tenga su sitio reservado y el registro no se salga de la ventana.
+        self._build_bottom(main)
+
+        self.pages_holder = tk.Frame(main, bg=BG)
+        self.pages_holder.pack(fill="both", expand=True, padx=S(28))
+        self.pages_holder.columnconfigure(0, weight=1)
+        self.pages_holder.rowconfigure(0, weight=1)
+
+        self.pages = {}
+        for key in ("download", "convert", "settings"):
+            page = tk.Frame(self.pages_holder, bg=BG)
+            page.grid(row=0, column=0, sticky="nsew")
+            self.pages[key] = page
+
+        self._build_download_page()
+        self._build_convert_page()
+        self._build_settings_page()
+        self._show_page("download")
+
+    def _build_sidebar(self):
+        bar = tk.Frame(self, bg=SIDEBAR, width=S(214))
+        bar.pack(side="left", fill="y")
+        bar.pack_propagate(False)
+
+        brand = tk.Frame(bar, bg=SIDEBAR)
+        brand.pack(fill="x", pady=(S(24), S(26)), padx=S(18))
+        logo = tk.Canvas(brand, width=S(38), height=S(38), bg=SIDEBAR,
+                         highlightthickness=0, bd=0)
+        logo.pack(side="left")
+        round_rect(logo, 0, 0, S(38), S(38), S(11), fill=ACCENT, outline=ACCENT)
+        logo.create_text(S(19), S(18), text="↓", fill="#ffffff", font=ui_font(16, "bold"))
+        titles = tk.Frame(brand, bg=SIDEBAR)
+        titles.pack(side="left", padx=(S(11), 0))
+        tk.Label(titles, text="Descargador", bg=SIDEBAR, fg=TEXT,
+                 font=ui_font(11, "bold")).pack(anchor="w")
+        tk.Label(titles, text="y Conversor", bg=SIDEBAR, fg=MUTED,
+                 font=ui_font(9)).pack(anchor="w")
+
+        self.nav = {}
+        for key, icon, text in (("download", "↓", "Descargar"),
+                                ("convert", "⇄", "Convertir"),
+                                ("settings", "⚙", "Ajustes")):
+            item = NavItem(bar, icon, text,
+                           command=lambda k=key: self._show_page(k))
+            item.pack(fill="x", pady=1)
+            self.nav[key] = item
+
+        footer = tk.Frame(bar, bg=SIDEBAR)
+        footer.pack(side="bottom", fill="x", padx=S(18), pady=S(18))
+        self.var_tools = tk.StringVar(value="Comprobando componentes…")
+        self.lbl_tools = tk.Label(footer, textvariable=self.var_tools, bg=SIDEBAR,
+                                  fg=MUTED, font=ui_font(8), justify="left",
+                                  anchor="w", wraplength=S(170))
+        self.lbl_tools.pack(fill="x")
+        tk.Label(footer, text=f"versión {APP_VERSION}", bg=SIDEBAR, fg="#4b5160",
+                 font=ui_font(8)).pack(anchor="w", pady=(S(8), 0))
+
+    PAGE_HEADERS = {
+        "download": ("Descargar", "Pega un enlace y elige en qué formato lo quieres."),
+        "convert": ("Convertir archivos",
+                    "Cambia el formato de vídeos y audios que ya tienes en el equipo."),
+        "settings": ("Ajustes",
+                     "Estado de los componentes que hacen el trabajo por debajo."),
+    }
+
+    def _show_page(self, key):
+        self.pages[key].tkraise()
+        for name, item in self.nav.items():
+            item.set_selected(name == key)
+        title, subtitle = self.PAGE_HEADERS[key]
+        self.header_title.configure(text=title)
+        self.header_sub.configure(text=subtitle)
+
+    # ---- página Descargar ----
+
+    def _build_download_page(self):
+        page = self.pages["download"]
+        page.columnconfigure(0, weight=1)
+
+        link = Card(page, title="Enlace")
+        link.grid(row=0, column=0, sticky="ew")
+        body = link.body
+        body.columnconfigure(0, weight=1)
+
+        self.var_url = tk.StringVar()
+        wrap, entry = make_entry(body, self.var_url)
+        wrap.grid(row=0, column=0, sticky="ew")
+        entry.bind("<Return>", lambda _e: self.start_download())
+        SoftButton(body, "Pegar", command=self._paste, kind="ghost", width=92,
+                   bg=CARD).grid(row=0, column=1, padx=(S(10), 0))
+
+        self.var_site = tk.StringVar(
+            value="Funciona con YouTube, TikTok, Reddit, X, Instagram, Twitch, "
+                  "Vimeo, SoundCloud y muchos más.")
+        self.lbl_site = tk.Label(body, textvariable=self.var_site, bg=CARD,
+                                 fg=MUTED, font=ui_font(9), wraplength=S(780),
+                                 justify="left", anchor="w")
+        self.lbl_site.grid(row=1, column=0, columnspan=2, sticky="w", pady=(S(10), 0))
+        self.var_url.trace_add("write", lambda *_: self._on_url_change())
+
+        fmt = Card(page, title="Formato y calidad")
+        fmt.grid(row=1, column=0, sticky="ew", pady=(S(14), 0))
+        body = fmt.body
+        body.columnconfigure(3, weight=1)
+
+        self.var_mode = tk.StringVar(value=self.config_data.get("mode", "video"))
+        Segmented(body, [("Vídeo + audio", "video"), ("Solo audio", "audio")],
+                  self.var_mode, bg=CARD, command=self._on_mode_change,
+                  width=300).grid(row=0, column=0, columnspan=4, sticky="w",
+                                  pady=(0, S(16)))
+
+        self.var_vformat = tk.StringVar(
+            value=self.config_data.get("video_format", "MP4"))
+        self.var_aformat = tk.StringVar(
+            value=self.config_data.get("audio_format", "MP3"))
+
+        field_label(body, "FORMATO").grid(row=1, column=0, sticky="w")
+        self.cmb_format = self._combo(body, 12)
+        self.cmb_format.grid(row=2, column=0, sticky="w", pady=(S(5), 0))
+        self.cmb_format.bind("<<ComboboxSelected>>", self._on_format_change)
+
+        field_label(body, "CALIDAD").grid(row=1, column=1, sticky="w", padx=(S(18), 0))
+        self.cmb_quality = self._combo(body, 24)
+        self.cmb_quality.grid(row=2, column=1, sticky="w", padx=(S(18), 0), pady=(S(5), 0))
+
+        field_label(body, "COOKIES DE").grid(row=1, column=2, sticky="w", padx=(S(18), 0))
+        self.cmb_cookies = self._combo(body, 12, values=BROWSERS)
+        self.cmb_cookies.set(self.config_data.get("cookies", "Ninguno"))
+        self.cmb_cookies.grid(row=2, column=2, sticky="w", padx=(S(18), 0), pady=(S(5), 0))
+
+        tk.Label(body, bg=CARD, fg=MUTED, font=ui_font(8), justify="left",
+                 anchor="w", wraplength=S(250),
+                 text=("Solo si un vídeo falla por edad, acceso privado o «confirma "
+                       "que no eres un robot». Cierra el navegador antes.")
+                 ).grid(row=2, column=3, sticky="w", padx=(S(14), 0), pady=(S(5), 0))
+
+        opts = tk.Frame(body, bg=CARD)
+        opts.grid(row=3, column=0, columnspan=4, sticky="w", pady=(S(18), 0))
+        self.var_playlist = tk.BooleanVar(value=False)
+        self.var_subs = tk.BooleanVar(value=False)
+        self.var_extras = tk.BooleanVar(value=True)
+        Check(opts, "Descargar la lista completa", self.var_playlist,
+              bg=CARD).pack(side="left", padx=(0, S(18)))
+        self.chk_subs = Check(opts, "Subtítulos (es/en)", self.var_subs, bg=CARD)
+        self.chk_subs.pack(side="left", padx=(0, S(18)))
+        Check(opts, "Carátula y metadatos", self.var_extras,
+              bg=CARD).pack(side="left")
+
+        dest = Card(page, title="Guardar en")
+        dest.grid(row=2, column=0, sticky="ew", pady=(S(14), 0))
+        body = dest.body
+        body.columnconfigure(0, weight=1)
+        self.var_outdir = tk.StringVar(
+            value=self.config_data.get("outdir") or default_download_dir())
+        wrap, _ = make_entry(body, self.var_outdir)
+        wrap.grid(row=0, column=0, sticky="ew")
+        SoftButton(body, "Examinar", command=self._pick_outdir, kind="ghost",
+                   width=104, bg=CARD).grid(row=0, column=1, padx=(S(10), 0))
+        SoftButton(body, "Abrir", command=self._open_outdir, kind="quiet",
+                   width=78, bg=CARD).grid(row=0, column=2, padx=(S(6), 0))
+
+        action = tk.Frame(page, bg=BG)
+        action.grid(row=3, column=0, sticky="ew", pady=(S(18), 0))
+        action.columnconfigure(0, weight=1)
+        self.btn_download = SoftButton(action, "Descargar", kind="accent",
+                                       command=self.start_download, height=46,
+                                       radius=11, bg=BG, icon="↓",
+                                       font=ui_font(11, "bold"))
+        self.btn_download.grid(row=0, column=0, sticky="ew")
+
+        tk.Label(page, bg=BG, fg="#5f677a", font=ui_font(8), justify="left",
+                 wraplength=S(760), anchor="w",
+                 text=("Descarga únicamente contenido propio, con licencia libre o "
+                       "para el que tengas permiso del titular de los derechos.")
+                 ).grid(row=4, column=0, sticky="w", pady=(S(12), 0))
+
+        self._on_mode_change()
+
+    def _on_mode_change(self):
+        if self.var_mode.get() == "audio":
+            self.cmb_format["values"] = AUDIO_FORMATS
+            self.cmb_format.set(self.var_aformat.get() if
+                                self.var_aformat.get() in AUDIO_FORMATS else "MP3")
+            self.chk_subs.set_enabled(False)
+        else:
+            self.cmb_format["values"] = VIDEO_FORMATS
+            self.cmb_format.set(self.var_vformat.get() if
+                                self.var_vformat.get() in VIDEO_FORMATS else "MP4")
+            self.chk_subs.set_enabled(True)
+        self._on_format_change()
+
+    def _on_format_change(self, _event=None):
+        fmt = self.cmb_format.get()
+        if self.var_mode.get() == "audio":
+            self.var_aformat.set(fmt)
+            if fmt in ("WAV", "FLAC"):
+                self.cmb_quality["values"] = PCM_QUALITIES
+                self.cmb_quality.set("16 bit / 44.1 kHz (CD)")
+            else:
+                self.cmb_quality["values"] = LOSSY_BITRATES
+                self.cmb_quality.set("320 kbps")
+        else:
+            self.var_vformat.set(fmt)
+            self.cmb_quality["values"] = [label for label, _ in VIDEO_RESOLUTIONS]
+            self.cmb_quality.set("1080p (Full HD)")
+
+    def _open_outdir(self):
+        self._open_folder(self.var_outdir.get())
+
+    def _open_folder(self, path):
+        if not os.path.isdir(path):
+            return
+        try:
+            if IS_WINDOWS:
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
+
+    # ---- página Convertir ----
+
+    def _build_convert_page(self):
+        page = self.pages["convert"]
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=1)
+
+        files_card = Card(page, title="Archivos",
+                          hint="Puedes añadir varios: se convierten uno tras otro.")
+        files_card.grid(row=0, column=0, sticky="nsew")
+        body = files_card.body
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        list_wrap = tk.Frame(body, bg=BORDER)
+        list_wrap.grid(row=0, column=0, sticky="nsew")
+        list_inner = tk.Frame(list_wrap, bg=FIELD)
+        list_inner.pack(fill="both", expand=True, padx=1, pady=1)
+        list_inner.columnconfigure(0, weight=1)
+        list_inner.rowconfigure(0, weight=1)
+
+        self.lst_files = tk.Listbox(list_inner, selectmode="extended",
+                                    activestyle="none", height=7, bd=0,
+                                    highlightthickness=0, bg=FIELD, fg=TEXT,
+                                    font=ui_font(9), selectbackground=ACCENT_LO,
+                                    selectforeground=TEXT)
+        self.lst_files.grid(row=0, column=0, sticky="nsew", padx=(S(8), 0), pady=S(6))
+        sb = ttk.Scrollbar(list_inner, orient="vertical",
+                           style="Dark.Vertical.TScrollbar",
+                           command=self.lst_files.yview)
+        sb.grid(row=0, column=1, sticky="ns", padx=(S(4), S(4)), pady=S(6))
+        self.lst_files.configure(yscrollcommand=sb.set)
+
+        btns = tk.Frame(body, bg=CARD)
+        btns.grid(row=0, column=1, sticky="n", padx=(S(12), 0))
+        SoftButton(btns, "Añadir", command=self._add_files, kind="ghost",
+                   width=108, bg=CARD).pack(pady=(0, S(7)))
+        SoftButton(btns, "Quitar", command=self._remove_files, kind="quiet",
+                   width=108, bg=CARD).pack(pady=(0, S(7)))
+        SoftButton(btns, "Vaciar", command=lambda: self.lst_files.delete(0, "end"),
+                   kind="quiet", width=108, bg=CARD).pack()
+
+        out = Card(page, title="Salida")
+        out.grid(row=1, column=0, sticky="ew", pady=(S(14), 0))
+        body = out.body
+        body.columnconfigure(2, weight=1)
+
+        field_label(body, "CONVERTIR A").grid(row=0, column=0, sticky="w")
+        self.cmb_target = self._combo(body, 12, values=CONVERT_TARGETS)
+        self.cmb_target.set("MP3")
+        self.cmb_target.grid(row=1, column=0, sticky="w", pady=(S(5), 0))
+        self.cmb_target.bind("<<ComboboxSelected>>", self._on_target_change)
+
+        field_label(body, "CALIDAD").grid(row=0, column=1, sticky="w", padx=(S(18), 0))
+        self.cmb_cquality = self._combo(body, 26)
+        self.cmb_cquality.grid(row=1, column=1, sticky="w", padx=(S(18), 0), pady=(S(5), 0))
+
+        self.lbl_res = field_label(body, "RESOLUCIÓN")
+        self.lbl_res.grid(row=0, column=2, sticky="w", padx=(S(18), 0))
+        self.cmb_cres = self._combo(body, 20,
+                                    values=[label for label, _ in VIDEO_RESOLUTIONS])
+        self.cmb_cres.set("Mejor disponible")
+        self.cmb_cres.grid(row=1, column=2, sticky="w", padx=(S(18), 0), pady=(S(5), 0))
+
+        self.var_same_dir = tk.BooleanVar(value=True)
+        Check(body, "Guardar junto al archivo original", self.var_same_dir,
+              bg=CARD, command=self._toggle_conv_dir).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(S(16), 0))
+
+        dest = tk.Frame(body, bg=CARD)
+        dest.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(S(8), 0))
+        dest.columnconfigure(0, weight=1)
+        self.var_conv_outdir = tk.StringVar(
+            value=self.config_data.get("conv_outdir") or default_download_dir())
+        self.frm_conv_dir, self.ent_conv_dir = make_entry(
+            dest, self.var_conv_outdir, state="disabled")
+        self.frm_conv_dir.grid(row=0, column=0, sticky="ew")
+        self.btn_conv_dir = SoftButton(dest, "Examinar",
+                                       command=self._pick_conv_outdir,
+                                       kind="ghost", width=104, bg=CARD)
+        self.btn_conv_dir.grid(row=0, column=1, padx=(S(10), 0))
+        self.btn_conv_dir.configure(state="disabled")
+
+        action = tk.Frame(page, bg=BG)
+        action.grid(row=2, column=0, sticky="ew", pady=(S(18), 0))
+        action.columnconfigure(0, weight=1)
+        self.btn_convert = SoftButton(action, "Convertir", kind="accent",
+                                      command=self.start_convert, height=46,
+                                      radius=11, bg=BG, icon="⇄",
+                                      font=ui_font(11, "bold"))
+        self.btn_convert.grid(row=0, column=0, sticky="ew")
+
+        self._on_target_change()
+
+    def _on_target_change(self, _event=None):
+        target = self.cmb_target.get()
+        if target in AUDIO_FORMATS:
+            if target in ("WAV", "FLAC"):
+                self.cmb_cquality["values"] = PCM_QUALITIES
+                self.cmb_cquality.set("16 bit / 44.1 kHz (CD)")
+            else:
+                self.cmb_cquality["values"] = LOSSY_BITRATES
+                self.cmb_cquality.set("320 kbps")
+            self.cmb_cres.state(["disabled"])
+        elif target == "GIF":
+            self.cmb_cquality["values"] = ["12 fps / 480 px", "15 fps / 640 px",
+                                           "10 fps / 320 px"]
+            self.cmb_cquality.set("12 fps / 480 px")
+            self.cmb_cres.state(["disabled"])
+        else:
+            self.cmb_cquality["values"] = VIDEO_QUALITY_LIST
+            self.cmb_cquality.set("Media (recomendada)")
+            self.cmb_cres.state(["!disabled"])
+
+    def _toggle_conv_dir(self):
+        enabled = not self.var_same_dir.get()
+        self.ent_conv_dir.configure(state="normal" if enabled else "disabled")
+        self.btn_conv_dir.configure(state="normal" if enabled else "disabled")
+
+    def _add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Selecciona archivos de vídeo o audio",
+            filetypes=[
+                ("Archivos multimedia", " ".join("*" + e for e in MEDIA_EXTS)),
+                ("Todos los archivos", "*.*"),
+            ],
+        )
+        existing = set(self.lst_files.get(0, "end"))
+        for p in paths:
+            if p not in existing:
+                self.lst_files.insert("end", p)
+
+    def _remove_files(self):
+        for index in reversed(self.lst_files.curselection()):
+            self.lst_files.delete(index)
+
+    def _pick_conv_outdir(self):
+        folder = filedialog.askdirectory(initialdir=self.var_conv_outdir.get())
+        if folder:
+            self.var_conv_outdir.set(folder)
+
+    # ---- página Ajustes ----
+
+    def _build_settings_page(self):
+        page = self.pages["settings"]
+        page.columnconfigure(0, weight=1)
+
+        tools = Card(page, title="Componentes necesarios",
+                     hint=("yt-dlp se encarga de la descarga y FFmpeg de unir pistas "
+                           "y convertir formatos. Ambos son gratuitos y de código "
+                           "abierto."))
+        tools.grid(row=0, column=0, sticky="ew")
+        body = tools.body
+        body.columnconfigure(0, weight=1)
+
+        self.dot_ytdlp, self.lbl_ytdlp = self._tool_row(
+            body, 0, "yt-dlp", "Descarga desde las webs de vídeo",
+            "Instalar / Actualizar", self.install_ytdlp)
+        self.dot_ffmpeg, self.lbl_ffmpeg, self.btn_ffmpeg = self._tool_row(
+            body, 1, "FFmpeg", "Une pistas y convierte formatos",
+            "Descargar automáticamente", self.install_ffmpeg, return_button=True)
+
+        SoftButton(body, "Comprobar de nuevo", command=self._refresh_tools,
+                   kind="quiet", width=168, bg=CARD).grid(
+            row=2, column=0, sticky="w", pady=(S(14), 0))
+
+        manual = Card(page, title="Instalación manual")
+        manual.grid(row=1, column=0, sticky="ew", pady=(S(14), 0))
+        tk.Label(manual.body, bg=CARD, fg=MUTED, font=ui_font(9), justify="left",
+                 anchor="w", wraplength=S(780),
+                 text=("•  yt-dlp:  abre una consola y ejecuta  pip install -U yt-dlp\n"
+                       "•  FFmpeg:  descárgalo de ffmpeg.org y añade su carpeta «bin» "
+                       "al PATH, o pulsa el botón de arriba y se guardará en la "
+                       "carpeta «bin» de esta aplicación.\n\n"
+                       "Los archivos descargados y convertidos nunca salen de tu "
+                       "equipo.")).pack(anchor="w")
+
+    def _tool_row(self, parent, row, name, subtitle, button_text, command,
+                  return_button=False):
+        frame = tk.Frame(parent, bg=CARD_SOFT, highlightthickness=1,
+                         highlightbackground=BORDER, highlightcolor=BORDER)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, S(10)))
+        frame.columnconfigure(1, weight=1)
+
+        dot = tk.Canvas(frame, width=S(10), height=S(10), bg=CARD_SOFT,
+                        highlightthickness=0, bd=0)
+        dot.create_oval(S(1), S(1), S(9), S(9), fill=MUTED, outline="")
+        dot.grid(row=0, column=0, rowspan=2, padx=(S(14), S(10)))
+
+        tk.Label(frame, text=name, bg=CARD_SOFT, fg=TEXT,
+                 font=ui_font(10, "bold")).grid(row=0, column=1, sticky="w",
+                                                pady=(S(12), 0))
+        status = tk.Label(frame, text="Comprobando…", bg=CARD_SOFT, fg=MUTED,
+                          font=ui_font(9), anchor="w")
+        status.grid(row=1, column=1, sticky="w", pady=(1, S(12)))
+        tk.Label(frame, text=subtitle, bg=CARD_SOFT, fg="#5f677a",
+                 font=ui_font(8)).grid(row=0, column=2, rowspan=2, sticky="e",
+                                       padx=(0, S(14)))
+
+        button = SoftButton(frame, button_text, command=command, kind="ghost",
+                            width=196, bg=CARD_SOFT)
+        button.grid(row=0, column=3, rowspan=2, padx=(0, S(12)), pady=S(10))
+        if return_button:
+            return dot, status, button
+        return dot, status
+
+    def _set_dot(self, dot, colour):
+        dot.delete("all")
+        dot.create_oval(S(1), S(1), S(9), S(9), fill=colour, outline="")
+
+    def _refresh_tools(self, initial=False):
+        self.ffmpeg = find_ffmpeg()
+        self.ffprobe = find_ffprobe()
+        self.ytdlp = find_ytdlp()
+
+        if self.ytdlp:
+            rc, out = run_capture(self.ytdlp + ["--version"])
+            version = out.splitlines()[-1] if rc == 0 and out else "?"
+            self.lbl_ytdlp.configure(text=f"Instalado  ·  versión {version}", fg=OK)
+            self._set_dot(self.dot_ytdlp, OK)
+        else:
+            self.lbl_ytdlp.configure(text="No encontrado — pulsa «Instalar»", fg=ERR)
+            self._set_dot(self.dot_ytdlp, ERR)
+
+        if self.ffmpeg:
+            rc, out = run_capture([self.ffmpeg, "-version"])
+            first = out.splitlines()[0] if out else ""
+            match = re.search(r"ffmpeg version (\S+)", first)
+            version = match.group(1) if match else "?"
+            self.lbl_ffmpeg.configure(text=f"Instalado  ·  {version}", fg=OK)
+            self._set_dot(self.dot_ffmpeg, OK)
+            self.btn_ffmpeg.configure(text="Reinstalar")
+        else:
+            self.lbl_ffmpeg.configure(text="No encontrado — necesario para convertir",
+                                      fg=ERR)
+            self._set_dot(self.dot_ffmpeg, ERR)
+            self.btn_ffmpeg.configure(text="Descargar automáticamente")
+
+        estado = ["yt-dlp listo" if self.ytdlp else "falta yt-dlp",
+                  "FFmpeg listo" if self.ffmpeg else "falta FFmpeg"]
+        self.var_tools.set("  ·  ".join(estado))
+        self.lbl_tools.configure(fg=OK if (self.ytdlp and self.ffmpeg) else WARN)
+
+        if initial and (not self.ytdlp or not self.ffmpeg):
+            faltan = []
+            if not self.ytdlp:
+                faltan.append("yt-dlp")
+            if not self.ffmpeg:
+                faltan.append("FFmpeg")
+            self.after(400, lambda: (
+                self._show_page("settings"),
+                messagebox.showinfo(
+                    "Falta " + " y ".join(faltan),
+                    "Para que la aplicación funcione hace falta instalar "
+                    + " y ".join(faltan) + ".\n\nPuedes hacerlo desde esta pantalla "
+                    "con los botones de la derecha.")))
+
+    # ---- zona inferior compartida ----
+
+    def _build_bottom(self, parent):
+        bottom = tk.Frame(parent, bg=BG)
+        bottom.pack(side="bottom", fill="x", padx=S(28), pady=(S(16), S(18)))
+        bottom.columnconfigure(0, weight=1)
+
+        bar = tk.Frame(bottom, bg=BG)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.columnconfigure(0, weight=1)
+        self.progress = ProgressBar(bar, bg=BG)
+        self.progress.grid(row=0, column=0, sticky="ew", pady=(0, S(2)))
+        self.btn_cancel = SoftButton(bar, "Cancelar", command=self.cancel_job,
+                                     kind="danger", width=100, height=30, bg=BG)
+        self.btn_cancel.grid(row=0, column=1, padx=(S(12), 0))
+        self.btn_cancel.configure(state="disabled")
+
+        line = tk.Frame(bottom, bg=BG)
+        line.grid(row=1, column=0, sticky="ew", pady=(S(8), 0))
+        line.columnconfigure(0, weight=1)
+        self.var_status = tk.StringVar(value="Listo.")
+        tk.Label(line, textvariable=self.var_status, bg=BG, fg=MUTED,
+                 font=ui_font(9), anchor="w").grid(row=0, column=0, sticky="ew")
+        self.btn_log = SoftButton(line, "Registro ▾", command=self._toggle_log,
+                                  kind="quiet", width=110, height=28, bg=BG,
+                                  font=ui_font(9, "bold"))
+        self.btn_log.grid(row=0, column=1)
+        SoftButton(line, "Limpiar", command=self._clear_log, kind="quiet",
+                   width=84, height=28, bg=BG,
+                   font=ui_font(9)).grid(row=0, column=2, padx=(S(4), 0))
+
+        self.log_frame = tk.Frame(bottom, bg=BORDER)
+        self.log_frame.grid(row=2, column=0, sticky="ew", pady=(S(10), 0))
+        inner = tk.Frame(self.log_frame, bg="#0c0e13")
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        inner.columnconfigure(0, weight=1)
+        self.txt_log = tk.Text(inner, height=6, wrap="none", bd=0,
+                               highlightthickness=0, font=mono_font(9),
+                               background="#0c0e13", foreground="#aeb6c6",
+                               insertbackground=TEXT, padx=S(12), pady=S(10),
+                               selectbackground=ACCENT_LO, state="disabled")
+        self.txt_log.grid(row=0, column=0, sticky="ew")
+        sb = ttk.Scrollbar(inner, orient="vertical",
+                           style="Dark.Vertical.TScrollbar",
+                           command=self.txt_log.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.txt_log.configure(yscrollcommand=sb.set)
+        self.txt_log.tag_configure("err", foreground=ERR)
+        self.txt_log.tag_configure("ok", foreground=OK)
+        self.txt_log.tag_configure("info", foreground=INFO)
+        self._log_visible = True
+
+    def _toggle_log(self):
+        self._log_visible = not self._log_visible
+        if self._log_visible:
+            self.log_frame.grid()
+            self.btn_log.configure(text="Registro ▾")
+        else:
+            self.log_frame.grid_remove()
+            self.btn_log.configure(text="Registro ▸")
+
+    def _clear_log(self):
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+
+    # ---------------- comunicación con hilos ----------------
+
+    def log(self, text, tag=None):
+        self.msg_queue.put(("log", (text, tag)))
+
+    def status(self, text):
+        self.msg_queue.put(("status", text))
+
+    def set_progress(self, value):
+        self.msg_queue.put(("progress", value))
+
+    def _drain_queue(self):
+        try:
+            while True:
+                kind, payload = self.msg_queue.get_nowait()
+                if kind == "log":
+                    text, tag = payload
+                    self.txt_log.configure(state="normal")
+                    self.txt_log.insert("end", text + "\n", tag or ())
+                    self.txt_log.see("end")
+                    self.txt_log.configure(state="disabled")
+                elif kind == "status":
+                    self.var_status.set(payload)
+                elif kind == "progress":
+                    if payload is None:
+                        self.progress.start_indeterminate()
+                    else:
+                        self.progress.set_value(payload)
+                elif kind == "done":
+                    self._job_finished()
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_queue)
+
+    def _job_finished(self):
+        self.worker = None
+        self.proc = None
+        self.btn_cancel.configure(state="disabled")
+        self.btn_download.configure(state="normal")
+        self.btn_convert.configure(state="normal")
+
+    def _start_job(self, target, args=()):
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Espera",
+                                   "Ya hay una tarea en marcha. Espera a que "
+                                   "termine o púlsala en «Cancelar».")
+            return False
+        self.cancelled = False
+        self.btn_cancel.configure(state="normal")
+        self.btn_download.configure(state="disabled")
+        self.btn_convert.configure(state="disabled")
+        self.set_progress(0)
+        self.worker = threading.Thread(target=target, args=args, daemon=True)
+        self.worker.start()
+        return True
+
+    def cancel_job(self):
+        self.cancelled = True
+        self.status("Cancelando…")
+        proc = self.proc
+        if proc and proc.poll() is None:
+            try:
+                if IS_WINDOWS:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                                   creationflags=creation_flags(),
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+
+    def _stream(self, cmd, on_line):
+        """Lanza un proceso y entrega cada línea de salida a on_line."""
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=creation_flags(),
+            env=clean_env(),
+            bufsize=1,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        for line in self.proc.stdout:
+            if self.cancelled:
+                break
+            on_line(line.rstrip("\r\n"))
+        self.proc.stdout.close()
+        return self.proc.wait()
+
+    # ---------------- acciones ----------------
+
+    def _paste(self):
+        try:
+            self.var_url.set(self.clipboard_get().strip())
+        except tk.TclError:
+            pass
+
+    def _on_url_change(self):
+        """Reconoce el sitio mientras se escribe y avisa de lo que necesita."""
+        url = self.var_url.get().strip()
+        if not url:
+            self.var_site.set(
+                "Funciona con YouTube, TikTok, Reddit, X, Instagram, Twitch, "
+                "Vimeo, SoundCloud y muchos más.")
+            return
+
+        site = detect_site(url)
+        if not site:
+            self.var_site.set(
+                "Sitio no reconocido: se intentará de todos modos. Muchas webs "
+                "usan un reproductor estándar que sí funciona.")
+            return
+
+        parts = ["Detectado: " + site["name"]]
+        if site.get("hint"):
+            parts.append(site["hint"])
+        if site.get("cookies") == "casi siempre" and \
+                self.cmb_cookies.get() == "Ninguno":
+            parts.append("Elige tu navegador en «Cookies de:».")
+        self.var_site.set("  ·  ".join(parts))
+
+        if site.get("audio") and self.var_mode.get() != "audio":
+            self.var_mode.set("audio")
+            self._on_mode_change()
+
+    def _pick_outdir(self):
+        folder = filedialog.askdirectory(initialdir=self.var_outdir.get())
+        if folder:
+            self.var_outdir.set(folder)
+
+    # ---- descarga ----
+
+    def start_download(self):
+        url = self.var_url.get().strip()
+        if not url:
+            messagebox.showwarning("Falta el enlace",
+                                   "Pega la dirección del vídeo que quieres descargar.")
+            return
+        if not self.ytdlp:
+            self._show_page("settings")
+            messagebox.showerror("Falta yt-dlp",
+                                 "Instala yt-dlp desde la pestaña «Ajustes».")
+            return
+        outdir = self.var_outdir.get().strip()
+        if not os.path.isdir(outdir):
+            try:
+                os.makedirs(outdir, exist_ok=True)
+            except Exception:
+                messagebox.showerror("Carpeta no válida",
+                                     "No se puede escribir en la carpeta elegida.")
+                return
+
+        quality = self.cmb_quality.get()
+        height = None
+        for label, value in VIDEO_RESOLUTIONS:
+            if label == quality:
+                height = value
+        opts = {
+            "mode": self.var_mode.get(),
+            "format": self.cmb_format.get(),
+            "quality": quality,
+            "height": height,
+            "outdir": outdir,
+            "playlist": self.var_playlist.get(),
+            "subs": self.var_subs.get(),
+            "extras": self.var_extras.get(),
+            "ffmpeg": self.ffmpeg,
+            "cookies": self.cmb_cookies.get(),
+            "site": detect_site(url),
+        }
+        self._save_config()
+        self._start_job(self._download_worker, (url, opts))
+
+    def _download_worker(self, url, opts):
+        site = opts.get("site")
+        self.log("▶ Descargando: " + url, "info")
+        if site:
+            self.log(f"   Sitio: {site['name']}", "info")
+            if site.get("cookies") == "casi siempre" and \
+                    opts.get("cookies", "Ninguno") == "Ninguno":
+                self.log("   Aviso: este sitio casi siempre pide una sesión "
+                         "iniciada. Si falla, elige tu navegador en «Cookies de:».",
+                         "err")
+        else:
+            self.log("   Sitio no reconocido: se intentará con el extractor "
+                     "genérico.", "info")
+        if not self.ffmpeg:
+            self.log("Aviso: FFmpeg no está disponible; puede que no se pueda unir "
+                     "vídeo y audio ni convertir el formato.", "err")
+        self.status("Preparando la descarga…")
+
+        pct_re = re.compile(r"\[download\]\s+([\d.]+)%")
+        dest_re = re.compile(r"\[download\] Destination: (.+)")
+        state = {"blocked": False, "bot": False}
+
+        def on_line(line):
+            if not line.strip():
+                return
+            match = pct_re.search(line)
+            if match:
+                pct = float(match.group(1))
+                self.set_progress(pct)
+                self.status(line.strip())
+                return
+            if BOT_RE.search(line):
+                state["bot"] = True
+            if BLOCK_RE.search(line):
+                state["blocked"] = True
+            if dest_re.search(line):
+                self.log(line, "info")
+            elif line.startswith("[Merger]") or line.startswith("[ExtractAudio]") \
+                    or line.startswith("[VideoConvertor]"):
+                self.status("Procesando con FFmpeg…")
+                self.set_progress(None)
+                self.log(line, "info")
+            elif "ERROR" in line or "error" in line.lower():
+                self.log(line, "err")
+            else:
+                self.log(line)
+
+        rc = 1
+        attempts = attempts_for(site)
+        total = len(attempts)
+        for index, attempt in enumerate(attempts):
+            if self.cancelled:
+                break
+            state["blocked"] = False
+            attempt_opts = dict(opts)
+            attempt_opts["client"] = attempt["client"]
+            attempt_opts["force_ipv4"] = attempt.get("force_ipv4", False)
+
+            if index:
+                self.log(f"↻ Reintento {index} de {total - 1}: pidiendo el vídeo "
+                         f"como cliente «{attempt['label']}»…", "info")
+                self.status(f"Reintentando ({index + 1} de {total})…")
+                self.set_progress(0)
+
+            cmd = self.ytdlp + build_ytdlp_args(url, attempt_opts)
+            try:
+                rc = self._stream(cmd, on_line)
+            except Exception as exc:
+                self.log(f"Error al ejecutar yt-dlp: {exc}", "err")
+                rc = 1
+
+            if rc == 0 or self.cancelled or not state["blocked"]:
+                break
+
+        self.set_progress(100 if rc == 0 else 0)
+        if self.cancelled:
+            self.status("Cancelado.")
+            self.log("■ Cancelado por el usuario.", "err")
+        elif rc == 0:
+            self.status("Descarga completada.")
+            self.log("✔ Listo. Archivos en: " + opts["outdir"], "ok")
+        else:
+            self.status("La descarga ha fallado.")
+            self.log(f"✖ yt-dlp terminó con el código {rc}.", "err")
+            self._explain_failure(state, opts)
+        self.msg_queue.put(("done", None))
+
+    def _explain_failure(self, state, opts):
+        """Traduce el fallo a algo accionable en lugar de un código de error."""
+        self.log("", None)
+        self.log("Qué probar, en este orden:", "info")
+        self.log("  1. Ajustes → «Instalar / Actualizar» en yt-dlp. Los sitios "
+                 "cambian a menudo y la mayoría de los bloqueos se arreglan con "
+                 "la versión más reciente.", "info")
+        if state.get("bot") or (opts.get("cookies", "Ninguno") == "Ninguno"):
+            self.log("  2. Elige tu navegador en «Cookies de:» (ciérralo antes) "
+                     "para descargar con tu sesión iniciada.", "info")
+        else:
+            self.log("  2. Prueba con otro navegador en «Cookies de:», o vuelve "
+                     "a poner «Ninguno».", "info")
+        self.log("  3. Baja la calidad a 720p: las pistas de 1080p y 4K son las "
+                 "que más se bloquean.", "info")
+        self.log("  4. Espera unos minutos: un exceso de descargas seguidas "
+                 "desde la misma conexión provoca bloqueos temporales.", "info")
+
+    # ---- conversión ----
+
+    def start_convert(self):
+        files = list(self.lst_files.get(0, "end"))
+        if not files:
+            messagebox.showwarning("Sin archivos",
+                                   "Añade al menos un archivo para convertir.")
+            return
+        if not self.ffmpeg:
+            self._show_page("settings")
+            messagebox.showerror("Falta FFmpeg",
+                                 "Instala FFmpeg desde la pestaña «Ajustes».")
+            return
+
+        target = self.cmb_target.get()
+        quality = self.cmb_cquality.get()
+        height = None
+        for label, value in VIDEO_RESOLUTIONS:
+            if label == self.cmb_cres.get():
+                height = value
+
+        opts = {"audio_quality": quality, "video_quality": quality, "height": height}
+        if target == "GIF":
+            fps, _, width = quality.replace(" px", "").partition(" fps / ")
+            opts["gif_fps"] = int(fps.strip() or 12)
+            opts["gif_width"] = int(width.strip() or 480)
+
+        outdir = None if self.var_same_dir.get() else self.var_conv_outdir.get()
+        if outdir and not os.path.isdir(outdir):
+            messagebox.showerror("Carpeta no válida",
+                                 "Elige una carpeta de salida existente.")
+            return
+        self._save_config()
+        self._start_job(self._convert_worker, (files, target, opts, outdir))
+
+    def _convert_worker(self, files, target, opts, outdir):
+        total = len(files)
+        ok_count = 0
+        ext = target.lower()
+
+        for index, src in enumerate(files, start=1):
+            if self.cancelled:
+                break
+            if not os.path.isfile(src):
+                self.log(f"✖ No existe: {src}", "err")
+                continue
+
+            folder = outdir or os.path.dirname(src)
+            name = os.path.splitext(os.path.basename(src))[0]
+            dst = unique_path(os.path.join(folder, f"{name}.{ext}"))
+            if os.path.abspath(dst) == os.path.abspath(src):
+                dst = unique_path(os.path.join(folder, f"{name}_convertido.{ext}"))
+
+            duration = probe_duration(self.ffprobe, src)
+            self.log(f"▶ [{index}/{total}] {os.path.basename(src)}  →  "
+                     f"{os.path.basename(dst)}", "info")
+            self.status(f"Convirtiendo {index} de {total}…")
+            self.set_progress(0 if duration else None)
+
+            cmd = [self.ffmpeg] + build_ffmpeg_args(src, dst, target, opts)
+            errors = []
+
+            def on_line(line):
+                if line.startswith("out_time_us=") and duration:
+                    try:
+                        secs = int(line.split("=", 1)[1]) / 1_000_000
+                        self.set_progress(secs / duration * 100)
+                        self.status(f"Convirtiendo {index} de {total}  ·  "
+                                    f"{human_time(secs)} / {human_time(duration)}")
+                    except Exception:
+                        pass
+                elif "=" not in line and line.strip():
+                    errors.append(line)
+                    self.log(line, "err")
+
+            try:
+                rc = self._stream(cmd, on_line)
+            except Exception as exc:
+                self.log(f"Error al ejecutar FFmpeg: {exc}", "err")
+                rc = 1
+
+            if self.cancelled:
+                if os.path.isfile(dst):
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        pass
+                break
+            if rc == 0 and os.path.isfile(dst):
+                ok_count += 1
+                self.set_progress(100)
+                self.log(f"✔ Guardado en {dst}", "ok")
+            else:
+                self.log(f"✖ Falló la conversión de {os.path.basename(src)} "
+                         f"(código {rc}).", "err")
+
+        if self.cancelled:
+            self.status("Cancelado.")
+            self.log("■ Cancelado por el usuario.", "err")
+        else:
+            self.status(f"Conversión terminada: {ok_count} de {total} archivos.")
+            self.log(f"✔ {ok_count} de {total} archivos convertidos.", "ok")
+        self.msg_queue.put(("done", None))
+
+    # ---- instalación de componentes ----
+
+    def install_ytdlp(self):
+        self._start_job(self._install_ytdlp_worker)
+
+    def _install_ytdlp_worker(self):
+        self.status("Instalando yt-dlp…")
+        self.set_progress(None)
+        self.log("▶ pip install -U yt-dlp", "info")
+        cmd = [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"]
+        try:
+            rc = self._stream(cmd, lambda line: self.log(line))
+        except Exception as exc:
+            self.log(str(exc), "err")
+            rc = 1
+        if rc != 0:
+            self.log("✖ No se pudo instalar. Prueba a ejecutar en una consola:  "
+                     "pip install -U yt-dlp", "err")
+            self.status("La instalación ha fallado.")
+        else:
+            self.log("✔ yt-dlp instalado o actualizado.", "ok")
+            self.status("yt-dlp listo.")
+        self.set_progress(0)
+        self.msg_queue.put(("done", None))
+        self.after(200, self._refresh_tools)
+
+    def install_ffmpeg(self):
+        if not IS_WINDOWS:
+            messagebox.showinfo(
+                "Instalación de FFmpeg",
+                "En este sistema instala FFmpeg con tu gestor de paquetes:\n\n"
+                "  macOS:  brew install ffmpeg\n"
+                "  Debian/Ubuntu:  sudo apt install ffmpeg\n"
+                "  Fedora:  sudo dnf install ffmpeg\n"
+                "  Arch:  sudo pacman -S ffmpeg")
+            return
+        if not messagebox.askyesno(
+                "Descargar FFmpeg",
+                "Se descargarán unos 80 MB desde el repositorio oficial de "
+                "compilaciones de FFmpeg (BtbN en GitHub) y se guardarán en la "
+                "carpeta «bin» de esta aplicación.\n\n¿Continuar?"):
+            return
+        self._start_job(self._install_ffmpeg_worker)
+
+    def _install_ffmpeg_worker(self):
+        os.makedirs(BIN_DIR, exist_ok=True)
+        zip_path = os.path.join(BIN_DIR, "_ffmpeg.zip")
+        self.status("Descargando FFmpeg…")
+        self.log("▶ " + FFMPEG_ZIP_URL, "info")
+
+        def hook(blocks, block_size, total):
+            if self.cancelled:
+                raise RuntimeError("cancelado")
+            if total > 0:
+                self.set_progress(blocks * block_size / total * 100)
+
+        try:
+            urllib.request.urlretrieve(FFMPEG_ZIP_URL, zip_path, hook)
+            self.status("Extrayendo…")
+            self.set_progress(None)
+            wanted = ("ffmpeg.exe", "ffprobe.exe")
+            with zipfile.ZipFile(zip_path) as zf:
+                for member in zf.namelist():
+                    base = os.path.basename(member)
+                    if base in wanted:
+                        with zf.open(member) as source, \
+                                open(os.path.join(BIN_DIR, base), "wb") as target:
+                            shutil.copyfileobj(source, target)
+                        self.log("  extraído " + base)
+            os.remove(zip_path)
+            self.log("✔ FFmpeg instalado en " + BIN_DIR, "ok")
+            self.status("FFmpeg listo.")
+        except Exception as exc:
+            self.log(f"✖ No se pudo instalar FFmpeg: {exc}", "err")
+            self.log("Alternativa: descárgalo de https://ffmpeg.org/download.html y "
+                     "copia ffmpeg.exe y ffprobe.exe en la carpeta 'bin'.", "err")
+            self.status("La instalación ha fallado.")
+            if os.path.isfile(zip_path):
+                try:
+                    os.remove(zip_path)
+                except Exception:
+                    pass
+        self.set_progress(0)
+        self.msg_queue.put(("done", None))
+        self.after(200, self._refresh_tools)
+
+    # ---------------- cierre ----------------
+
+    def _on_close(self):
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno("Salir",
+                                       "Hay una tarea en marcha. ¿Cerrar de todos "
+                                       "modos?"):
+                return
+            self.cancel_job()
+            time.sleep(0.3)
+        self._save_config()
+        self.destroy()
+
+
+def main():
+    enable_dpi_awareness()
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
